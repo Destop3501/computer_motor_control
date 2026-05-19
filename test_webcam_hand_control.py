@@ -20,7 +20,7 @@ class ByeGestureController:
         self.WAVE_MIN_REVERSALS = 3      # Number of directional shifts required to confirm a wave
         self.WAVE_MIN_AMPLITUDE_PX = 40  # Minimum sweep size (in pixels) to register a wave
         self.WAVE_TRIGGER_SWINGS = 8     # Required swings to trigger the bye event callback
-        self.WAVE_COOLDOWN_SEC = 30.0    # Cooldown duration in seconds
+        self.WAVE_COOLDOWN_SEC = 16.0    # Cooldown duration in seconds (aligned with ESP32's 15s watchdog)
         self.cooldown_until = 0.0        # Timestamp when the cooldown expires
         self.announcement_end_time = 0.0 # Timestamp when center banner ends
         self.announcement_hand = ""      # Hand that triggered the announcement
