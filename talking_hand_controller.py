@@ -13,7 +13,8 @@ except ImportError:
     pass
 
 # Neutral Home Positions
-HOME_MG996R = 0.0
+HOME_MG996R_L = 0.0
+HOME_MG996R_R = 180.0
 HOME_SG90 = 90.0
 
 class TalkingHandController:
@@ -45,10 +46,10 @@ class TalkingHandController:
                     break
 
             # MG996R: 40–100° | SG90: 45–90° (independent random each step)
-            left_mg = random.uniform(40.0, 100.0)
-            right_mg = random.uniform(40.0, 100.0)
-            left_sg = random.uniform(45.0, 90.0)
-            right_sg = random.uniform(45.0, 90.0)
+            left_mg = random.uniform(60.0, 90.0)
+            right_mg = random.uniform(120.0, 90.0)
+            left_sg = random.uniform(70.0, 110.0)
+            right_sg = random.uniform(70.0, 110.0)
             
             print(f"[TALKING GESTURE] L_M (MG996R): {left_mg:5.1f}° | L_S (SG90): {left_sg:5.1f}° | "
                   f"R_M (MG996R): {right_mg:5.1f}° | R_S (SG90): {right_sg:5.1f}°")
@@ -62,12 +63,12 @@ class TalkingHandController:
             time.sleep(self.update_interval)
             
         # Reset to home positions once speech completes
-        print(f"[SILENT HOME]     L_M (MG996R): {HOME_MG996R:5.1f}° | L_S (SG90): {HOME_SG90:5.1f}° | "
-              f"R_M (MG996R): {HOME_MG996R:5.1f}° | R_S (SG90): {HOME_SG90:5.1f}°")
+        print(f"[SILENT HOME]     L_M (MG996R): {HOME_MG996R_L:5.1f}° | L_S (SG90): {HOME_SG90:5.1f}° | "
+              f"R_M (MG996R): {HOME_MG996R_R:5.1f}° | R_S (SG90): {HOME_SG90:5.1f}°")
         
         if self.on_angles_callback:
             try:
-                self.on_angles_callback(HOME_MG996R, HOME_SG90, HOME_MG996R, HOME_SG90)
+                self.on_angles_callback(HOME_MG996R_L, HOME_SG90, HOME_MG996R_R, HOME_SG90)
             except Exception as e:
                 print(f"[CALLBACK ERROR] Failed to send home angles: {e}")
                 

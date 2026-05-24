@@ -53,9 +53,9 @@ class SmoothServoController:
         self._stop = threading.Event()
         self._thread = None
 
-        self._goal = [0.0, 90.0, 0.0, 90.0]
-        self._target = [0.0, 90.0, 0.0, 90.0]
-        self._output = [0.0, 90.0, 0.0, 90.0]
+        self._goal = [0.0, 90.0, 180.0, 90.0]
+        self._target = [0.0, 90.0, 180.0, 90.0]
+        self._output = [0.0, 90.0, 180.0, 90.0]
         self._last_sent = None
         self._last_send_time = 0.0
 
@@ -191,7 +191,7 @@ class ByeWaveSequence:
                 with self._lock:
                     self._state = "to_home"
                 print("[MOTOR CONTROLLER] Returning home.")
-                self.smooth.set_targets(0.0, 90.0, 0.0, 90.0)
+                self.smooth.set_targets(0.0, 90.0, 180.0, 90.0)
         elif state == "to_home" and self.smooth.at_target():
             with self._lock:
                 self._state = "idle"
@@ -201,11 +201,12 @@ class ByeWaveSequence:
 def get_bye_callback(smooth, bye_seq):
     def handle_bye(physical_side, intensity):
         active_side = random.choice(["LEFT", "RIGHT"])
-        mg_wave = random.uniform(150.0, 170.0)
-        sg_wave = random.uniform(0.0, 40.0)
-        left_mg = mg_wave if active_side == "LEFT" else 0.0
+        mg_l_wave = random.uniform(150.0, 170.0)
+        mg_r_wave = random.uniform(10.0, 30.0)
+        sg_wave = random.uniform(80.0, 100.0)
+        left_mg = mg_l_wave if active_side == "LEFT" else 0.0
         left_sg = sg_wave if active_side == "LEFT" else 90.0
-        right_mg = mg_wave if active_side == "RIGHT" else 0.0
+        right_mg = mg_r_wave if active_side == "RIGHT" else 180.0
         right_sg = sg_wave if active_side == "RIGHT" else 90.0
         if not bye_seq.start(left_mg, left_sg, right_mg, right_sg, active_side):
             print("[MOTOR CONTROLLER] Bye ignored — sequence in progress.")
@@ -307,7 +308,7 @@ def main():
             esp32_reader_thread.join(timeout=1.0)
         if ser is not None and ser.is_open:
             try:
-                smooth.set_targets(0.0, 90.0, 0.0, 90.0)
+                smooth.set_targets(0.0, 90.0, 180.0, 90.0)
                 time.sleep(0.5)
                 ser.close()
             except Exception as e:
