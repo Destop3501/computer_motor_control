@@ -23,7 +23,7 @@ class TalkingHandController:
         self.is_speaking = False
         self.gesture_thread = None
         self.lock = threading.Lock()
-        
+
         # Initialize pyttsx3 engine if available
         if TTS_AVAILABLE:
             try:
@@ -37,18 +37,16 @@ class TalkingHandController:
             self.engine = None
 
     def _gesture_loop(self):
-        """Background loop that randomizes hand positions while speaking is active."""
+        """Background loop — full-range random hand poses while speaking (EMA smooths on PC)."""
         print("\n--- [Robot Speaking] Hand Randomizer Started ---")
         while True:
             with self.lock:
                 if not self.is_speaking:
                     break
-            
-            # MG996R: Range 40 to 100
+
+            # MG996R: 40–100° | SG90: 45–90° (independent random each step)
             left_mg = random.uniform(40.0, 100.0)
             right_mg = random.uniform(40.0, 100.0)
-            
-            # SG90: Range 45 to 90
             left_sg = random.uniform(45.0, 90.0)
             right_sg = random.uniform(45.0, 90.0)
             
@@ -96,7 +94,7 @@ class TalkingHandController:
             
         with self.lock:
             self.is_speaking = True
-            
+
         # Start the background gesture thread
         self.gesture_thread = threading.Thread(target=self._gesture_loop, daemon=True)
         self.gesture_thread.start()
