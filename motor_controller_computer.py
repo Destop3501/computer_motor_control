@@ -20,17 +20,37 @@ serial_lock = threading.Lock()
 ESP32_BOOT_DELAY_SEC = 2.0
 BYE_HOLD_SEC = 10.0
 
-# Smoothing / streaming
+# Smoothing / streaming (patterns from voice-agentv4 robot_eyes servo_worker)
 SERVO_RATE_HZ = 50.0
-EMA_ALPHA = 0.12              # Output filter: lower = smoother, more lag
-TARGET_EMA_ALPHA = 0.25       # Softens abrupt talk/bye target jumps
-SEND_DEADBAND_DEG = 0.4       # Skip serial if all channels changed less than this
 SERIAL_KEEPALIVE_SEC = 4.0
-AT_TARGET_DEG = 0.35
+AT_TARGET_DEG = 0.5
+HOME_SG90 = 92.0
+SG90_INDICES = (1, 3)
+MG_INDICES = (0, 2)
+
+# MG996R — rate-limited steps (robot_eyes: SMOOTHING=0.10, MAX_STEP=1.4, DEADZONE=0.22)
+MG_SMOOTHING = 0.10
+MG_MAX_STEP_DEG = 1.2
+MG_DEADZONE_DEG = 0.35
+MG_GOAL_BLEND = 0.12          # Soft goal tracking before step limiter
+
+# SG90 — slower steps + ignore tiny goal changes
+SG90_SMOOTHING = 0.08
+SG90_MAX_STEP_DEG = 0.9
+SG90_DEADZONE_DEG = 0.5
+SG90_MIN_MOVE_DEG = 2
+SG90_GOAL_BLEND = 0.15
 
 
 def _clamp_angle(angle):
     return max(0.0, min(180.0, angle))
+
+
+def _clamp_step(error, smoothing, max_step, deadzone):
+    """voice-agentv4-style capped servo step toward a target."""
+    if abs(error) < deadzone:
+        return 0.0
+    return max(-max_step, min(max_step, error * smoothing))
 
 
 def _format_packet(angles):
@@ -41,10 +61,8 @@ def _format_packet(angles):
 
 class SmoothServoController:
     """
-    Two-stage smoothing:
-      1) TARGET_EMA on set_targets (gesture layer)
-      2) EMA_ALPHA on dedicated 50 Hz thread (stream to ESP32)
-    ESP32 also interpolates at 50 Hz — motion stays smooth even if a packet is late.
+    MG996R / SG90: rate-limited motion (voice-agentv4 robot_eyes servo_worker).
+    Goals can jump from talk/bye; output moves in small capped steps at 50 Hz.
     """
 
     def __init__(self, ser_conn):
@@ -53,9 +71,9 @@ class SmoothServoController:
         self._stop = threading.Event()
         self._thread = None
 
-        self._goal = [0.0, 90.0, 180.0, 90.0]
-        self._target = [0.0, 90.0, 180.0, 90.0]
-        self._output = [0.0, 90.0, 180.0, 90.0]
+        self._goal = [0.0, HOME_SG90, 180.0, HOME_SG90]
+        self._target = [0.0, HOME_SG90, 180.0, HOME_SG90]
+        self._output = [0.0, HOME_SG90, 180.0, HOME_SG90]
         self._last_sent = None
         self._last_send_time = 0.0
 
@@ -74,16 +92,40 @@ class SmoothServoController:
                 abs(self._goal[i] - self._output[i]) < AT_TARGET_DEG for i in range(4)
             )
 
-    def set_targets(self, left_mg, left_sg, right_mg, right_sg):
+    def _set_sg90_goal(self, idx, angle, force=False):
+        value = round(_clamp_angle(angle))
+        current = round(self._output[idx])
+        if not force and abs(value - current) < SG90_MIN_MOVE_DEG:
+            return
+        self._goal[idx] = value
+        if force:
+            self._target[idx] = float(value)
+            self._output[idx] = float(value)
+
+    def set_targets(self, left_mg, left_sg, right_mg, right_sg, force_sg90=False):
         goals = [
             _clamp_angle(left_mg),
             _clamp_angle(left_sg),
             _clamp_angle(right_mg),
             _clamp_angle(right_sg),
         ]
+        home_snapshot = None
         with self._lock:
-            for i in range(4):
-                self._goal[i] = goals[i]
+            if force_sg90:
+                for i in range(4):
+                    v = round(goals[i]) if i in SG90_INDICES else goals[i]
+                    self._goal[i] = v
+                    self._target[i] = float(v)
+                    self._output[i] = float(v)
+                home_snapshot = [self._output[i] for i in range(4)]
+            else:
+                self._goal[0] = goals[0]
+                self._goal[2] = goals[2]
+                self._set_sg90_goal(1, goals[1], force=False)
+                self._set_sg90_goal(3, goals[3], force=False)
+
+        if home_snapshot is not None:
+            self._send(home_snapshot)
 
     def _servo_loop(self):
         interval = 1.0 / SERVO_RATE_HZ
@@ -96,8 +138,18 @@ class SmoothServoController:
     def _tick(self):
         with self._lock:
             for i in range(4):
-                self._target[i] += TARGET_EMA_ALPHA * (self._goal[i] - self._target[i])
-                self._output[i] += EMA_ALPHA * (self._target[i] - self._output[i])
+                if i in MG_INDICES:
+                    self._target[i] += MG_GOAL_BLEND * (self._goal[i] - self._target[i])
+                    err = self._target[i] - self._output[i]
+                    self._output[i] += _clamp_step(
+                        err, MG_SMOOTHING, MG_MAX_STEP_DEG, MG_DEADZONE_DEG
+                    )
+                else:
+                    self._target[i] += SG90_GOAL_BLEND * (self._goal[i] - self._target[i])
+                    err = self._target[i] - self._output[i]
+                    self._output[i] += _clamp_step(
+                        err, SG90_SMOOTHING, SG90_MAX_STEP_DEG, SG90_DEADZONE_DEG
+                    )
             snapshot = [_clamp_angle(v) for v in self._output]
 
         now = time.time()
@@ -107,15 +159,20 @@ class SmoothServoController:
     def _should_send(self, angles, now):
         if self._last_sent is None:
             return True
-        if any(abs(angles[i] - self._last_sent[i]) >= SEND_DEADBAND_DEG for i in range(4)):
-            return True
+        rounded = tuple(int(round(a)) for a in angles)
+        for i in range(4):
+            if i in SG90_INDICES:
+                if abs(rounded[i] - self._last_sent[i]) >= SG90_MIN_MOVE_DEG:
+                    return True
+            elif rounded[i] != self._last_sent[i]:
+                return True
         return now - self._last_send_time >= SERIAL_KEEPALIVE_SEC
 
     def _send(self, angles):
         if self.ser is None or not self.ser.is_open:
             return
-        rounded = tuple(int(round(a)) for a in angles)
         packet = _format_packet(angles)
+        rounded = tuple(int(round(a)) for a in angles)
         try:
             with serial_lock:
                 self.ser.write(packet.encode("ascii"))
@@ -191,7 +248,7 @@ class ByeWaveSequence:
                 with self._lock:
                     self._state = "to_home"
                 print("[MOTOR CONTROLLER] Returning home.")
-                self.smooth.set_targets(0.0, 90.0, 180.0, 90.0)
+                self.smooth.set_targets(0.0, HOME_SG90, 180.0, HOME_SG90, force_sg90=True)
         elif state == "to_home" and self.smooth.at_target():
             with self._lock:
                 self._state = "idle"
@@ -205,9 +262,9 @@ def get_bye_callback(smooth, bye_seq):
         mg_r_wave = random.uniform(10.0, 30.0)
         sg_wave = random.uniform(80.0, 100.0)
         left_mg = mg_l_wave if active_side == "LEFT" else 0.0
-        left_sg = sg_wave if active_side == "LEFT" else 90.0
+        left_sg = sg_wave if active_side == "LEFT" else HOME_SG90
         right_mg = mg_r_wave if active_side == "RIGHT" else 180.0
-        right_sg = sg_wave if active_side == "RIGHT" else 90.0
+        right_sg = sg_wave if active_side == "RIGHT" else HOME_SG90
         if not bye_seq.start(left_mg, left_sg, right_mg, right_sg, active_side):
             print("[MOTOR CONTROLLER] Bye ignored — sequence in progress.")
 
@@ -218,7 +275,8 @@ def get_talk_callback(smooth, bye_seq):
     def handle_talk_angles(left_mg, left_sg, right_mg, right_sg):
         if bye_seq.busy:
             return
-        smooth.set_targets(left_mg, left_sg, right_mg, right_sg)
+        force_sg90 = round(left_sg) == round(HOME_SG90) and round(right_sg) == round(HOME_SG90)
+        smooth.set_targets(left_mg, left_sg, right_mg, right_sg, force_sg90=force_sg90)
         print(
             f"[TALK RANDOMIZER] L_M:{left_mg:5.1f} L_S:{left_sg:5.1f} | "
             f"R_M:{right_mg:5.1f} R_S:{right_sg:5.1f}"
@@ -231,7 +289,10 @@ def main():
     print("\n=======================================================")
     print("      [MOTOR CONTROLLER] EMA + 50 Hz serial stream")
     print("=======================================================")
-    print(f"  * Servo thread: {SERVO_RATE_HZ:.0f} Hz | EMA α={EMA_ALPHA}")
+    print(
+        f"  * Servo thread: {SERVO_RATE_HZ:.0f} Hz | "
+        f"MG step≤{MG_MAX_STEP_DEG}° SG90 step≤{SG90_MAX_STEP_DEG}°"
+    )
     print(f"  * Serial: compact CSV @ {BAUD_RATE} baud on {SERIAL_PORT}")
     print("  * Press ESC or Q to quit.")
     print("=======================================================\n")
@@ -268,7 +329,7 @@ def main():
     bye_seq = ByeWaveSequence(smooth)
     controller = ByeGestureController(on_bye_callback=get_bye_callback(smooth, bye_seq))
     talk_controller = TalkingHandController(
-        update_interval=0.4,
+        update_interval=1.4,
         on_angles_callback=get_talk_callback(smooth, bye_seq),
     )
 
@@ -308,8 +369,8 @@ def main():
             esp32_reader_thread.join(timeout=1.0)
         if ser is not None and ser.is_open:
             try:
-                smooth.set_targets(0.0, 90.0, 180.0, 90.0)
-                time.sleep(0.5)
+                smooth.set_targets(0.0, HOME_SG90, 180.0, HOME_SG90, force_sg90=True)
+                time.sleep(0.8)
                 ser.close()
             except Exception as e:
                 print(f"[SERIAL CLEANUP ERROR] {e}")

@@ -15,7 +15,11 @@ except ImportError:
 # Neutral Home Positions
 HOME_MG996R_L = 0.0
 HOME_MG996R_R = 180.0
-HOME_SG90 = 90.0
+HOME_SG90 = 92.0  # Must match motor_controller_computer / ESP32 home
+SG90_MIN_MOVE_DEG = 2
+SG90_MAX_GESTURE_STEP = 12.0  # Max relative step per talk tick (continuous sweep)
+MG_MAX_GESTURE_STEP = 10.0  # Max change per talk step (voice-agent caps servo steps)
+TTS_RATE_WPM = 170
 
 class TalkingHandController:
     def __init__(self, update_interval=0.4, on_angles_callback=None):
@@ -24,32 +28,70 @@ class TalkingHandController:
         self.is_speaking = False
         self.gesture_thread = None
         self.lock = threading.Lock()
+        self._tts_available = TTS_AVAILABLE
+        self._last_left_mg = HOME_MG996R_L
+        self._last_right_mg = HOME_MG996R_R
+        self._last_left_sg = HOME_SG90
+        self._last_right_sg = HOME_SG90
 
         # Initialize pyttsx3 engine if available
-        if TTS_AVAILABLE:
-            try:
-                self.engine = pyttsx3.init()
-                # Adjust speech rate (default is usually ~200, 160-180 sounds more natural)
-                self.engine.setProperty('rate', 170)
-            except Exception as e:
-                print(f"[WARNING] TTS engine initialization failed: {e}. Falling back to simulation.")
-                self.engine = None
-        else:
-            self.engine = None
+    def _init_tts_engine(self):
+        engine = pyttsx3.init()
+        engine.setProperty("rate", TTS_RATE_WPM)
+        return engine
+
+    def _estimate_speech_duration_sec(self, text):
+        """Lower bound for gesture duration; covers TTS finishing early."""
+        words = max(1, len(text.split()))
+        wpm_duration = (words / TTS_RATE_WPM) * 60.0
+        sim_duration = words * 0.28  # matches _speak_fallback ~0.2–0.35 s/word
+        return max(wpm_duration * 1.1, sim_duration, 1.0)
+
+    def _step_mg(self, previous, lo, hi):
+        """Small MG996R delta per gesture (smooth layer finishes the motion)."""
+        prev = previous
+        delta = random.uniform(-MG_MAX_GESTURE_STEP, MG_MAX_GESTURE_STEP)
+        return max(lo, min(hi, prev + delta))
+
+    def _random_sg90(self, previous, lo=55.0, hi=85.0):
+        """Relative SG90 step (like _step_mg): small delta from previous, clamped to range."""
+        prev = round(previous)
+        delta = random.uniform(-SG90_MAX_GESTURE_STEP, SG90_MAX_GESTURE_STEP)
+        candidate = round(max(lo, min(hi, prev + delta)))
+
+        if abs(candidate - prev) < SG90_MIN_MOVE_DEG:
+            # Nudge by minimum step without a large leap — use room toward range interior
+            if prev + SG90_MIN_MOVE_DEG <= hi:
+                candidate = round(min(hi, prev + SG90_MIN_MOVE_DEG))
+            elif prev - SG90_MIN_MOVE_DEG >= lo:
+                candidate = round(max(lo, prev - SG90_MIN_MOVE_DEG))
+            else:
+                return prev
+
+        if abs(candidate - prev) < SG90_MIN_MOVE_DEG:
+            return prev
+        return int(candidate)
 
     def _gesture_loop(self):
         """Background loop — full-range random hand poses while speaking (EMA smooths on PC)."""
         print("\n--- [Robot Speaking] Hand Randomizer Started ---")
+        self._last_left_mg = HOME_MG996R_L
+        self._last_right_mg = HOME_MG996R_R
+        self._last_left_sg = HOME_SG90
+        self._last_right_sg = HOME_SG90
         while True:
             with self.lock:
                 if not self.is_speaking:
                     break
 
-            # MG996R: 40–100° | SG90: 45–90° (independent random each step)
-            left_mg = random.uniform(60.0, 90.0)
-            right_mg = random.uniform(120.0, 90.0)
-            left_sg = random.uniform(70.0, 110.0)
-            right_sg = random.uniform(70.0, 110.0)
+            left_mg = self._step_mg(self._last_left_mg, 60.0, 90.0)
+            right_mg = self._step_mg(self._last_right_mg, 90.0, 120.0)
+            left_sg = self._random_sg90(self._last_left_sg)
+            right_sg = self._random_sg90(self._last_right_sg)
+            self._last_left_mg = left_mg
+            self._last_right_mg = right_mg
+            self._last_left_sg = left_sg
+            self._last_right_sg = right_sg
             
             print(f"[TALKING GESTURE] L_M (MG996R): {left_mg:5.1f}° | L_S (SG90): {left_sg:5.1f}° | "
                   f"R_M (MG996R): {right_mg:5.1f}° | R_S (SG90): {right_sg:5.1f}°")
@@ -88,10 +130,33 @@ class TalkingHandController:
             time.sleep(max(0.15, random.uniform(0.2, 0.35)))
         print()
 
+    def _run_tts(self, text):
+        """Run TTS or console simulation in a worker thread."""
+        if self._tts_available:
+            engine = None
+            try:
+                engine = self._init_tts_engine()
+                engine.say(text)
+                engine.runAndWait()
+            except Exception as e:
+                print(f"[WARNING] TTS failed: {e}. Using simulation timing.")
+                self._speak_fallback(text)
+            finally:
+                if engine is not None:
+                    try:
+                        engine.stop()
+                    except Exception:
+                        pass
+        else:
+            self._speak_fallback(text)
+
     def speak(self, text):
         """Speak the text and trigger random hand gestures."""
         if not text.strip():
             return
+        
+        duration_est = self._estimate_speech_duration_sec(text)
+        start_time = time.time()
             
         with self.lock:
             self.is_speaking = True
@@ -100,14 +165,12 @@ class TalkingHandController:
         self.gesture_thread = threading.Thread(target=self._gesture_loop, daemon=True)
         self.gesture_thread.start()
 
+        tts_thread = threading.Thread(target=self._run_tts, args=(text,), daemon=True)
+        tts_thread.start()
+
         try:
-            if self.engine:
-                # Active TTS mode
-                self.engine.say(text)
-                self.engine.runAndWait()
-            else:
-                # Simulation mode
-                self._speak_fallback(text)
+            while tts_thread.is_alive() or (time.time() - start_time) < duration_est:
+                time.sleep(0.05)
         finally:
             with self.lock:
                 self.is_speaking = False
@@ -127,8 +190,8 @@ def main():
     print("=====================================================")
     print("   Robot Speech Hand Gestures Controller (Logic-Only)")
     print("=====================================================")
-    if TTS_AVAILABLE and controller.engine:
-        print("  * Text-To-Speech Engine: ACTIVE (pyttsx3)")
+    if TTS_AVAILABLE and controller._tts_available:
+        print("  * Text-To-Speech Engine: ACTIVE (pyttsx3, fresh engine per phrase)")
     else:
         print("  * Text-To-Speech Engine: SIMULATION MODE (No pyttsx3)")
     print(f"  * MG996R range: [{40} - {100}] degrees")
